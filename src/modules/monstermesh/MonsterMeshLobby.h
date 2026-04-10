@@ -31,7 +31,7 @@ struct PlayerStats {
 class MonsterMeshLobby {
 public:
     static constexpr uint8_t  MAX_PEERS            = 8;
-    static constexpr uint32_t BEACON_INTERVAL_MS   = 120000;
+    static constexpr uint32_t BEACON_INTERVAL_MS   = 900000;  // 15 min
     static constexpr uint32_t PEER_TIMEOUT_MS      = 300000;
     static constexpr uint16_t ELO_DEFAULT          = 1200;
     static constexpr uint16_t ELO_FLOOR            = 100;
