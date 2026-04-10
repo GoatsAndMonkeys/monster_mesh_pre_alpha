@@ -1073,6 +1073,9 @@ static uint8_t  g_micPollCounter = 0;      // only peek every N cycles
 
 // ── Trackball encoder hook — intercepts press to cycle palette in emulator ──
 static bool g_encPrevPressed = false;  // edge detection for trackball click
+static uint32_t g_encLastClickMs = 0;  // debounce timer
+static constexpr uint32_t ENC_DEBOUNCE_MS = 400;  // ignore clicks within 400ms
+
 static void monsterMeshEncoderRead(lv_indev_t *indev, lv_indev_data_t *data)
 {
     // Call original encoder driver first (reads trackball hardware)
@@ -1084,12 +1087,14 @@ static void monsterMeshEncoderRead(lv_indev_t *indev, lv_indev_data_t *data)
     if (mmEmu || mmBrowser) {
         bool pressed = (data->state == LV_INDEV_STATE_PRESSED);
         if (pressed && !g_encPrevPressed) {
-            if (mmEmu) {
-                // Cycle palette on trackball click while playing
-                g_emuPaletteIdx = (g_emuPaletteIdx + 1) % EMU_PALETTE_COUNT;
-            } else if (mmBrowser) {
-                // Trackball click = Enter in file browser (select ROM)
-                monsterMeshModule->handleKeyFromLVGL(0x0D);
+            uint32_t now = millis();
+            if (now - g_encLastClickMs >= ENC_DEBOUNCE_MS) {
+                g_encLastClickMs = now;
+                if (mmEmu) {
+                    g_emuPaletteIdx = (g_emuPaletteIdx + 1) % EMU_PALETTE_COUNT;
+                } else if (mmBrowser) {
+                    monsterMeshModule->handleKeyFromLVGL(0x0D);
+                }
             }
         }
         g_encPrevPressed = pressed;
@@ -1510,9 +1515,19 @@ void MonsterMeshModule::renderTaskEntry(void *pv)
 
 void MonsterMeshModule::renderTaskLoop()
 {
+    // Wait for startup to settle — LVGL teardown, LGFX init, and radio
+    // are all contending for SPI during the first few hundred ms
+    vTaskDelay(pdMS_TO_TICKS(1000));
+
+    uint32_t frameN = 0;
     while (true) {
-        if (emulatorActive_ && frameDirty_) {
+        if (emulatorActive_ && frameDirty_ && frameBuf_) {
             blitFrame();
+            // Log stack high-water mark every ~5s to detect near-overflow
+            if (++frameN % 150 == 1) {
+                UBaseType_t hwm = uxTaskGetStackHighWaterMark(NULL);
+                LOG_INFO("[MonsterMesh] render stack HWM: %u words free\n", (unsigned)hwm);
+            }
         }
         // ~30fps render rate — emulator runs at 60fps independently
         vTaskDelay(pdMS_TO_TICKS(33));
@@ -1785,12 +1800,21 @@ void MonsterMeshModule::renderBrowser()
 
 void MonsterMeshModule::launchROM(const char *path)
 {
-    // Show "Loading ROM..." on the browser screen so the user
-    // knows the 2-3s SD read is happening (not a freeze)
+    // Show "Loading ROM..." then suppress LVGL before the SD read
+    // to prevent SPI contention (LVGL flush + SD read = same SPI bus)
 #if HAS_TFT
     if (g_browserLvLabel) {
         lv_label_set_text(g_browserLvLabel, "\n\n\n     Loading ROM...");
         lv_refr_now(lv_display_get_default());
+    }
+    // Suppress LVGL flush BEFORE the SD read — both share the SPI bus
+    lv_display_t *disp = lv_display_get_default();
+    if (disp) {
+        savedFlushCb_ = (void *)disp->flush_cb;
+        lv_display_set_flush_cb(disp, [](lv_display_t *d, const lv_area_t *a, uint8_t *px) {
+            lv_display_flush_ready(d);
+        });
+        if (disp->refr_timer) lv_timer_pause(disp->refr_timer);
     }
 #endif
 
@@ -1800,12 +1824,21 @@ void MonsterMeshModule::launchROM(const char *path)
     snprintf(vfsPath, sizeof(vfsPath), "/sd%s", path);
     LOG_INFO("[MonsterMesh] Launching ROM: %s\n", vfsPath);
 
-    // Don't hold spiLock here — SD.open() needs SPI access internally
     bool romOk = emu_.begin(vfsPath);
     if (!romOk) {
         LOG_WARN("[MonsterMesh] Failed to load ROM: %s\n", vfsPath);
         snprintf(setupStatusBuf_, sizeof(setupStatusBuf_), "FAIL: %s", vfsPath);
         setupStatus_ = setupStatusBuf_;
+#if HAS_TFT
+        // Restore LVGL on failure
+        if (disp) {
+            if (savedFlushCb_) {
+                lv_display_set_flush_cb(disp, (lv_display_flush_cb_t)savedFlushCb_);
+                savedFlushCb_ = nullptr;
+            }
+            if (disp->refr_timer) lv_timer_resume(disp->refr_timer);
+        }
+#endif
         browser_.markDirty();  // redraw browser
         return;
     }
@@ -1813,16 +1846,7 @@ void MonsterMeshModule::launchROM(const char *path)
     emuInitialized_ = true;
     browserActive_ = false;
 #if HAS_TFT
-    lvgl_hide_browser();  // restore Meshtastic LVGL screen before emulator takes over
-    // Suppress LVGL flush + pause refresh timer so nothing bleeds through
-    lv_display_t *disp = lv_display_get_default();
-    if (disp) {
-        savedFlushCb_ = (void *)disp->flush_cb;
-        lv_display_set_flush_cb(disp, [](lv_display_t *d, const lv_area_t *a, uint8_t *px) {
-            lv_display_flush_ready(d);
-        });
-        if (disp->refr_timer) lv_timer_pause(disp->refr_timer);
-    }
+    lvgl_hide_browser();  // clean up browser LVGL objects
 #endif
     emulatorActive_ = true;
     kbSetMode(true);  // switch keyboard to RAW mode for emulator input
@@ -1849,14 +1873,17 @@ void MonsterMeshModule::launchROM(const char *path)
 
     // Create render task on Core 0 (lower priority — blits framebuffer to TFT
     // without blocking the emulator task, so audio stays smooth)
+    // 8192 stack: LovyanGFX pushImage + SPI DMA needs more than 4K
     if (!renderTaskHandle_) {
         xTaskCreatePinnedToCore(
             renderTaskEntry, "monstermesh_render",
-            4096, this, 2, &renderTaskHandle_, 0
+            8192, this, 2, &renderTaskHandle_, 0
         );
     }
 
     // Set up LGFX for emulator rendering (LVGL flush already suppressed)
+    // IMPORTANT: call getGfx() here to ensure the LGFX instance is created
+    // on the main task BEFORE the render task starts calling blitFrame()
 #if HAS_TFT
     lgfx::LGFX_Device *gfx = getGfx();
     if (gfx) {
